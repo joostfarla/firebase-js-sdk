@@ -32,9 +32,10 @@ const plugins = [
   })
 ];
 
-const external = Object.keys(
+const deps = Object.keys(
   Object.assign({}, pkg.peerDependencies, pkg.dependencies)
 );
+
 export default {
   input: 'index.ts',
   output: [
@@ -42,5 +43,5 @@ export default {
     { file: pkg.module, format: 'es' }
   ],
   plugins,
-  external
+  external: id => deps.some(dep => id === dep || id.startsWith(`${dep}/`))
 };
