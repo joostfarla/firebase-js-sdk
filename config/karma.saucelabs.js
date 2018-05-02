@@ -22,7 +22,6 @@ const karmaBase = require('./karma.base');
 /** Tests in these packages are excluded due to flakiness or long run time. */
 const excluded = [
   'packages/database/*',
-  'packages/firestore/*',
   'integration/firestore/*',
   'integration/messaging/*'
 ];
