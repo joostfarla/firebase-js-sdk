@@ -26,7 +26,7 @@ import {
   DocumentMap,
   MaybeDocumentMap
 } from '../model/collections';
-import { MaybeDocument } from '../model/document';
+import { MaybeDocument, NoDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
 import { Mutation } from '../model/mutation';
 import {
@@ -34,13 +34,8 @@ import {
   MutationBatch,
   MutationBatchResult
 } from '../model/mutation_batch';
-import {
-  RemoteEvent,
-  ResetMapping,
-  TargetChange,
-  UpdateMapping
-} from '../remote/remote_event';
-import { assert, fail } from '../util/assert';
+import { TargetChangeSet } from '../remote/remote_event';
+import { assert } from '../util/assert';
 import * as log from '../util/log';
 import * as objUtils from '../util/obj';
 
@@ -485,56 +480,95 @@ export class LocalStore {
    * LocalDocuments are re-calculated if there are remaining mutations in the
    * queue.
    */
-  applyRemoteEvent(remoteEvent: RemoteEvent): Promise<MaybeDocumentMap> {
+  applyRemoteEvent(
+    targetChanges: { [targetId: number]: TargetChangeSet },
+    resolvedLimboKeys: DocumentKeySet,
+    documentUpdates: MaybeDocumentMap
+  ): Promise<MaybeDocumentMap> {
     const documentBuffer = new RemoteDocumentChangeBuffer(this.remoteDocuments);
+
+    let remoteVersion = SnapshotVersion.MIN;
+
     return this.persistence.runTransaction('Apply remote event', true, txn => {
       const promises = [] as Array<PersistencePromise<void>>;
+
       objUtils.forEachNumber(
-        remoteEvent.targetChanges,
-        (targetId: TargetId, change: TargetChange) => {
+        targetChanges,
+        (targetId: TargetId, changeSet: TargetChangeSet) => {
           // Do not ref/unref unassigned targetIds - it may lead to leaks.
           let queryData = this.targetIds[targetId];
           if (!queryData) return;
 
-          const mapping: UpdateMapping | ResetMapping = change.mapping;
-          if (mapping) {
+          if (remoteVersion === SnapshotVersion.MIN) {
+            remoteVersion = changeSet.snapshotVersion;
+          } else {
+            assert(
+              remoteVersion === changeSet.snapshotVersion,
+              `Expected all targets to be at version ${remoteVersion}, but found ${
+                changeSet.snapshotVersion
+              }`
+            );
+          }
+
+          if (changeSet.changeType === 'reset') {
             // First make sure that all references are deleted
-            if (mapping instanceof ResetMapping) {
-              promises.push(
-                this.queryCache
-                  .removeMatchingKeysForTargetId(txn, targetId)
-                  .next(() => {
-                    return this.queryCache.addMatchingKeys(
-                      txn,
-                      mapping.documents,
-                      targetId
-                    );
-                  })
-              );
-            } else if (mapping instanceof UpdateMapping) {
-              promises.push(
-                this.queryCache
-                  .removeMatchingKeys(txn, mapping.removedDocuments, targetId)
-                  .next(() => {
-                    return this.queryCache.addMatchingKeys(
-                      txn,
-                      mapping.addedDocuments,
-                      targetId
-                    );
-                  })
-              );
-            } else {
-              return fail('Unknown mapping type: ' + JSON.stringify(mapping));
-            }
+            promises.push(
+              this.queryCache
+                .removeMatchingKeysForTargetId(
+                  txn,
+                  targetId,
+                  changeSet.snapshotVersion
+                )
+                .next(() => {
+                  return this.queryCache.addMatchingKeys(
+                    txn,
+                    changeSet.addedDocuments,
+                    targetId,
+                    changeSet.snapshotVersion
+                  );
+                })
+            );
+          } else {
+            assert(
+              changeSet.changeType === 'update',
+              'Expected change to be of type update'
+            );
+            // TODO(multitab): Optimize these mutations so they don't perform
+            // three reads + three writes.
+            promises.push(
+              this.queryCache
+                .removeMatchingKeys(
+                  txn,
+                  changeSet.removedDocuments,
+                  targetId,
+                  changeSet.snapshotVersion
+                )
+                .next(() => {
+                  return this.queryCache.addMatchingKeys(
+                    txn,
+                    changeSet.addedDocuments,
+                    targetId,
+                    changeSet.snapshotVersion
+                  );
+                })
+                .next(() => {
+                  return this.queryCache.addModifiedKeys(
+                    txn,
+                    changeSet.modifiedDocuments,
+                    targetId,
+                    changeSet.snapshotVersion
+                  );
+                })
+            );
           }
 
           // Update the resume token if the change includes one. Don't clear
           // any preexisting value.
-          const resumeToken = change.resumeToken;
+          const resumeToken = changeSet.resumeToken;
           if (resumeToken.length > 0) {
             queryData = queryData.update({
               resumeToken,
-              snapshotVersion: change.snapshotVersion
+              snapshotVersion: changeSet.snapshotVersion
             });
             this.targetIds[targetId] = queryData;
             promises.push(this.queryCache.updateQueryData(txn, queryData));
@@ -542,8 +576,38 @@ export class LocalStore {
         }
       );
 
-      let changedDocKeys = documentKeySet();
-      remoteEvent.documentUpdates.forEach((key, doc) => {
+      resolvedLimboKeys.forEach(key => {
+        // When listening to a query the server responds with a snapshot
+        // containing documents matching the query and a current marker
+        // telling us we're now in sync. It's possible for these to arrive
+        // as separate remote events or as a single remote event.
+        // For a document query, there will be no documents sent in the
+        // response if the document doesn't exist.
+        //
+        // If the snapshot arrives separately from the current marker,
+        // we handle it normally and updateTrackedLimbos will resolve the
+        // limbo status of the document, removing it from limboDocumentRefs.
+        // This works because clients only initiate limbo resolution when
+        // a target is current and because all current targets are
+        // always at a consistent snapshot.
+        //
+        // However, if the document doesn't exist and the current marker
+        // arrives, the document is not present in the snapshot and our
+        // normal view handling would consider the document to remain in
+        // limbo indefinitely because there are no updates to the document.
+        // To avoid this, we specially handle this case here:
+        // synthesizing a delete.
+        //
+        // TODO(dimond): Ideally we would have an explicit lookup query
+        // instead resulting in an explicit delete message and we could
+        // remove this special logic.
+        documentBuffer.addEntry(new NoDocument(key, remoteVersion));
+        this.garbageCollector.addPotentialGarbageKey(key);
+      });
+
+      let changedDocKeys = resolvedLimboKeys;
+
+      documentUpdates.forEach((key, doc) => {
         changedDocKeys = changedDocKeys.add(key);
         promises.push(
           documentBuffer.getEntry(txn, key).next(existingDoc => {
@@ -581,7 +645,6 @@ export class LocalStore {
       // trying to resolve the state of a locally cached document that is in
       // limbo.
       const lastRemoteVersion = this.queryCache.getLastRemoteSnapshotVersion();
-      const remoteVersion = remoteEvent.snapshotVersion;
       if (!remoteVersion.isEqual(SnapshotVersion.MIN)) {
         assert(
           remoteVersion.compareTo(lastRemoteVersion) >= 0,

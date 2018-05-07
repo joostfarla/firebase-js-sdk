@@ -17,7 +17,7 @@
 import { Query } from '../core/query';
 import { SnapshotVersion } from '../core/snapshot_version';
 import { TargetId } from '../core/types';
-import { DocumentKeySet } from '../model/collections';
+import { documentKeySet, DocumentKeySet } from '../model/collections';
 import { DocumentKey } from '../model/document_key';
 import { ObjectMap } from '../util/obj_map';
 
@@ -28,12 +28,28 @@ import { QueryCache } from './query_cache';
 import { QueryData } from './query_data';
 import { ReferenceSet } from './reference_set';
 import { assert } from '../util/assert';
+import { SortedMap } from '../util/sorted_map';
+import { primitiveComparator } from '../util/misc';
+
+type TargetSnapshot = { targetId: TargetId; snapshotVersion: SnapshotVersion };
 
 export class MemoryQueryCache implements QueryCache {
   /**
    * Maps a query to the data about that query
    */
   private queries = new ObjectMap<Query, QueryData>(q => q.canonicalId());
+
+  /**
+   * Tracks the updated keys of a query by snapshot version.
+   */
+  private targetChanges = new SortedMap<TargetSnapshot, DocumentKeySet>(
+    (left, right) => {
+      const cmp = primitiveComparator(left.targetId, right.targetId);
+      return cmp !== 0
+        ? cmp
+        : left.snapshotVersion.compareTo(right.snapshotVersion);
+    }
+  );
 
   /** The last received snapshot version. */
   private lastRemoteSnapshotVersion = SnapshotVersion.MIN;
@@ -129,26 +145,64 @@ export class MemoryQueryCache implements QueryCache {
   addMatchingKeys(
     txn: PersistenceTransaction,
     keys: DocumentKeySet,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void> {
     this.references.addReferences(keys, targetId);
-    return PersistencePromise.resolve();
+    return this.getChanges(txn, targetId, snapshotVersion).next(
+      documentUpdates => {
+        this.targetChanges = this.targetChanges.insert(
+          { targetId, snapshotVersion },
+          documentUpdates.unionWith(keys)
+        );
+      }
+    );
   }
 
   removeMatchingKeys(
     txn: PersistenceTransaction,
     keys: DocumentKeySet,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void> {
     this.references.removeReferences(keys, targetId);
-    return PersistencePromise.resolve();
+    return this.getChanges(txn, targetId, snapshotVersion).next(
+      documentUpdates => {
+        this.targetChanges = this.targetChanges.insert(
+          { targetId, snapshotVersion },
+          documentUpdates.unionWith(keys)
+        );
+      }
+    );
   }
 
   removeMatchingKeysForTargetId(
     txn: PersistenceTransaction,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void> {
     this.references.removeReferencesForId(targetId);
+
+    const snapshotsToDelete: TargetSnapshot[] = [];
+    const it = this.targetChanges.getIteratorFrom({
+      targetId,
+      snapshotVersion: SnapshotVersion.MIN
+    });
+    while (it.hasNext()) {
+      const key = it.getNext().key;
+      if (
+        key.targetId !== targetId ||
+        key.snapshotVersion.compareTo(snapshotVersion) > 0
+      ) {
+        break;
+      }
+      snapshotsToDelete.push(key);
+    }
+
+    snapshotsToDelete.forEach(key => {
+      this.targetChanges = this.targetChanges.remove(key);
+    });
+
     return PersistencePromise.resolve();
   }
 
@@ -169,5 +223,57 @@ export class MemoryQueryCache implements QueryCache {
     key: DocumentKey
   ): PersistencePromise<boolean> {
     return this.references.containsKey(txn, key);
+  }
+
+  addModifiedKeys(
+    txn: PersistenceTransaction,
+    keys: DocumentKeySet,
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): PersistencePromise<void> {
+    return this.getChanges(txn, targetId, snapshotVersion).next(
+      documentUpdates => {
+        this.targetChanges = this.targetChanges.insert(
+          { targetId, snapshotVersion },
+          documentUpdates.unionWith(keys)
+        );
+      }
+    );
+  }
+
+  getAccumulatedChanges(
+    transaction: PersistenceTransaction,
+    targetId: TargetId,
+    fromVersion: SnapshotVersion
+  ): PersistencePromise<DocumentKeySet> {
+    let documentUpdates = documentKeySet();
+    const it = this.targetChanges.getIteratorFrom({
+      targetId,
+      snapshotVersion: fromVersion
+    });
+
+    while (it.hasNext()) {
+      const entry = it.getNext();
+      if (entry.key.targetId !== targetId) {
+        break;
+      }
+      documentUpdates = documentUpdates.unionWith(entry.value);
+    }
+
+    return PersistencePromise.resolve(documentUpdates);
+  }
+
+  private getChanges(
+    transaction: PersistenceTransaction,
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): PersistencePromise<DocumentKeySet> {
+    const changes = this.targetChanges.get({ targetId, snapshotVersion });
+
+    if (!changes) {
+      return PersistencePromise.resolve(documentKeySet());
+    }
+
+    return PersistencePromise.resolve(changes);
   }
 }

@@ -172,12 +172,12 @@ export class WatchChangeAggregator {
     let change = this.targetChanges[targetId];
     if (!change) {
       // Create an UpdateMapping by default, since resets are always explicit.
-      change = {
-        currentStatusUpdate: CurrentStatusUpdate.None,
-        snapshotVersion: this.snapshotVersion,
-        mapping: new UpdateMapping(),
-        resumeToken: emptyByteString()
-      };
+      change = new TargetChange(
+        CurrentStatusUpdate.None,
+        new UpdateMapping(),
+        this.snapshotVersion,
+        emptyByteString()
+      );
       this.targetChanges[targetId] = change;
     }
     return change;

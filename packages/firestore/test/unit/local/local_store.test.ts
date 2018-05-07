@@ -25,7 +25,11 @@ import { LocalStore, LocalWriteResult } from '../../../src/local/local_store';
 import { LocalViewChanges } from '../../../src/local/local_view_changes';
 import { NoOpGarbageCollector } from '../../../src/local/no_op_garbage_collector';
 import { Persistence } from '../../../src/local/persistence';
-import { DocumentMap, MaybeDocumentMap } from '../../../src/model/collections';
+import {
+  documentKeySet,
+  DocumentMap,
+  MaybeDocumentMap
+} from '../../../src/model/collections';
 import {
   Document,
   MaybeDocument,
@@ -43,7 +47,7 @@ import {
   MutationBatchResult
 } from '../../../src/model/mutation_batch';
 import { emptyByteString } from '../../../src/platform/platform';
-import { RemoteEvent } from '../../../src/remote/remote_event';
+import { RemoteEvent, TargetChangeSet } from '../../../src/remote/remote_event';
 import {
   WatchChangeAggregator,
   WatchTargetChange,
@@ -68,6 +72,29 @@ import {
 } from '../../util/helpers';
 
 import * as persistenceHelpers from './persistence_test_helpers';
+import * as objUtils from '../../../src/util/obj';
+
+function applyRemoteEvent(
+  localStore: LocalStore,
+  remoteEvent: RemoteEvent
+): Promise<MaybeDocumentMap> {
+  const changes: { [targetId: number]: TargetChangeSet } = {};
+
+  objUtils.forEachNumber(
+    remoteEvent.targetChanges,
+    (targetId, targetChange) => {
+      changes[targetId] = targetChange.toChanges(
+        /* existingKeys= */ documentKeySet()
+      );
+    }
+  );
+
+  return localStore.applyRemoteEvent(
+    changes,
+    /* resolvedLimboKeys= */ documentKeySet(),
+    remoteEvent.documentUpdates
+  );
+}
 
 class LocalStoreTester {
   private promiseChain: Promise<void> = Promise.resolve();
@@ -112,9 +139,7 @@ class LocalStoreTester {
 
   afterRemoteEvent(remoteEvent: RemoteEvent): LocalStoreTester {
     this.promiseChain = this.promiseChain
-      .then(() => {
-        return this.localStore.applyRemoteEvent(remoteEvent);
-      })
+      .then(() => applyRemoteEvent(this.localStore, remoteEvent))
       .then((result: MaybeDocumentMap) => {
         this.lastChanges = result;
       });
@@ -857,10 +882,12 @@ function genericLocalStoreTests(
     const query = Query.atPath(path('foo'));
     const queryData = await localStore.allocateQuery(query);
     expect(queryData.targetId).to.equal(2);
-    await localStore.applyRemoteEvent(
+    await applyRemoteEvent(
+      localStore,
       docUpdateRemoteEvent(doc('foo/baz', 10, { a: 'b' }), [2], [])
     );
-    await localStore.applyRemoteEvent(
+    await applyRemoteEvent(
+      localStore,
       docUpdateRemoteEvent(doc('foo/bar', 20, { a: 'b' }), [2], [])
     );
     await localStore.localWrite([setMutation('foo/bonk', { a: 'b' })]);
@@ -893,7 +920,7 @@ function genericLocalStoreTests(
     );
     aggregator.add(watchChange);
     const remoteEvent = aggregator.createRemoteEvent();
-    await localStore.applyRemoteEvent(remoteEvent);
+    await applyRemoteEvent(localStore, remoteEvent);
 
     // Stop listening so that the query should become inactive (but persistent)
     await localStore.releaseQuery(query);
@@ -922,7 +949,7 @@ function genericLocalStoreTests(
     );
     aggregator1.add(watchChange1);
     const remoteEvent1 = aggregator1.createRemoteEvent();
-    await localStore.applyRemoteEvent(remoteEvent1);
+    await applyRemoteEvent(localStore, remoteEvent1);
 
     const watchChange2 = new WatchTargetChange(
       WatchTargetChangeState.Current,
@@ -936,7 +963,7 @@ function genericLocalStoreTests(
     );
     aggregator2.add(watchChange2);
     const remoteEvent2 = aggregator2.createRemoteEvent();
-    await localStore.applyRemoteEvent(remoteEvent2);
+    await applyRemoteEvent(localStore, remoteEvent2);
 
     // Stop listening so that the query should become inactive (but persistent)
     await localStore.releaseQuery(query);

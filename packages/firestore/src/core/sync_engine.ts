@@ -20,12 +20,12 @@ import { LocalStore } from '../local/local_store';
 import { LocalViewChanges } from '../local/local_view_changes';
 import { QueryData, QueryPurpose } from '../local/query_data';
 import { ReferenceSet } from '../local/reference_set';
-import { MaybeDocumentMap } from '../model/collections';
+import { documentKeySet, MaybeDocumentMap } from '../model/collections';
 import { MaybeDocument, NoDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
 import { Mutation } from '../model/mutation';
 import { MutationBatchResult } from '../model/mutation_batch';
-import { RemoteEvent } from '../remote/remote_event';
+import { RemoteEvent, TargetChangeSet } from '../remote/remote_event';
 import { RemoteStore } from '../remote/remote_store';
 import { RemoteSyncer } from '../remote/remote_syncer';
 import { assert, fail } from '../util/assert';
@@ -315,6 +315,11 @@ export class SyncEngine implements RemoteSyncer, SharedClientStateSyncer {
   applyRemoteEvent(remoteEvent: RemoteEvent): Promise<void> {
     this.assertSubscribed('applyRemoteEvent()');
 
+    const targetChanges: { [targetId: number]: TargetChangeSet } = {};
+
+    const documentUpdates = remoteEvent.documentUpdates;
+    let resolvedLimboKeys = documentKeySet();
+
     // Make sure limbo documents are deleted if there were no results.
     // Filter out document additions to targets that they already belong to.
     objUtils.forEachNumber(
@@ -324,19 +329,23 @@ export class SyncEngine implements RemoteSyncer, SharedClientStateSyncer {
         if (!limboKey) {
           const qv = this.queryViewsByTarget[targetId];
           assert(!!qv, 'Missing QueryView for non-limbo query: ' + targetId);
-          targetChange.mapping.filterUpdates(qv.view.syncedDocuments);
-        } else {
-          remoteEvent.synthesizeDeleteForLimboTargetChange(
-            targetChange,
-            limboKey
+          targetChanges[targetId] = targetChange.toChanges(
+            qv.view.syncedDocuments
           );
+        } else if (
+          targetChange.isCurrent() &&
+          documentUpdates.get(limboKey) === null
+        ) {
+          resolvedLimboKeys = resolvedLimboKeys.add(limboKey);
         }
       }
     );
 
-    return this.localStore.applyRemoteEvent(remoteEvent).then(changes => {
-      return this.emitNewSnapsAndNotifyLocalStore(changes, remoteEvent);
-    });
+    return this.localStore
+      .applyRemoteEvent(targetChanges, resolvedLimboKeys, documentUpdates)
+      .then(changes => {
+        return this.emitNewSnapsAndNotifyLocalStore(changes, remoteEvent);
+      });
   }
 
   /**

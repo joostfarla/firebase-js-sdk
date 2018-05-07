@@ -27,6 +27,8 @@ import * as EncodedResourcePath from './encoded_resource_path';
 import { GarbageCollector } from './garbage_collector';
 import {
   DbTarget,
+  DbTargetChange,
+  DbTargetChangeKey,
   DbTargetDocument,
   DbTargetDocumentKey,
   DbTargetGlobal,
@@ -123,7 +125,11 @@ export class IndexedDbQueryCache implements QueryCache {
     queryData: QueryData
   ): PersistencePromise<void> {
     assert(this.metadata.targetCount > 0, 'Removing from an empty query cache');
-    return this.removeMatchingKeysForTargetId(transaction, queryData.targetId)
+    return this.removeMatchingKeysForTargetId(
+      transaction,
+      queryData.targetId,
+      SnapshotVersion.MIN
+    )
       .next(() => targetsStore(transaction).delete(queryData.targetId))
       .next(() => {
         this.metadata.targetCount -= 1;
@@ -199,7 +205,8 @@ export class IndexedDbQueryCache implements QueryCache {
   addMatchingKeys(
     txn: PersistenceTransaction,
     keys: DocumentKeySet,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void> {
     // PORTING NOTE: The reverse index (documentsTargets) is maintained by
     // Indexeddb.
@@ -209,13 +216,27 @@ export class IndexedDbQueryCache implements QueryCache {
       const path = EncodedResourcePath.encode(key.path);
       promises.push(store.put(new DbTargetDocument(targetId, path)));
     });
+
+    promises.push(
+      this.getChanges(txn, targetId, snapshotVersion).next(documentUpdates =>
+        targetChangeStore(txn).put(
+          this.serializer.toDbTargetChanges(
+            targetId,
+            snapshotVersion,
+            documentUpdates.unionWith(keys)
+          )
+        )
+      )
+    );
+
     return PersistencePromise.waitFor(promises);
   }
 
   removeMatchingKeys(
     txn: PersistenceTransaction,
     keys: DocumentKeySet,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void> {
     // PORTING NOTE: The reverse index (documentsTargets) is maintained by
     // IndexedDb.
@@ -228,12 +249,26 @@ export class IndexedDbQueryCache implements QueryCache {
         this.garbageCollector.addPotentialGarbageKey(key);
       }
     });
+
+    promises.push(
+      this.getChanges(txn, targetId, snapshotVersion).next(documentUpdates =>
+        targetChangeStore(txn).put(
+          this.serializer.toDbTargetChanges(
+            targetId,
+            snapshotVersion,
+            documentUpdates.unionWith(keys)
+          )
+        )
+      )
+    );
+
     return PersistencePromise.waitFor(promises);
   }
 
   removeMatchingKeysForTargetId(
     txn: PersistenceTransaction,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void> {
     const store = documentTargetStore(txn);
     const range = IDBKeyRange.bound(
@@ -242,8 +277,40 @@ export class IndexedDbQueryCache implements QueryCache {
       /*lowerOpen=*/ false,
       /*upperOpen=*/ true
     );
-    return this.notifyGCForRemovedKeys(txn, range).next(() =>
-      store.delete(range)
+    return this.notifyGCForRemovedKeys(txn, range)
+      .next(() => store.delete(range))
+      .next(() => {
+        const range = IDBKeyRange.bound(
+          [
+            targetId,
+            this.serializer.toTimestampArray(SnapshotVersion.MIN.toTimestamp())
+          ],
+          [
+            targetId,
+            this.serializer.toTimestampArray(snapshotVersion.toTimestamp())
+          ],
+          /*lowerOpen=*/ false,
+          /*upperOpen=*/ false
+        );
+        return targetChangeStore(txn).delete(range);
+      });
+  }
+
+  addModifiedKeys(
+    txn: PersistenceTransaction,
+    keys: DocumentKeySet,
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): PersistencePromise<void> {
+    return this.getAccumulatedChanges(txn, targetId, snapshotVersion).next(
+      documentUpdates =>
+        targetChangeStore(txn).put(
+          this.serializer.toDbTargetChanges(
+            targetId,
+            snapshotVersion,
+            documentUpdates.unionWith(keys)
+          )
+        )
     );
   }
 
@@ -327,6 +394,46 @@ export class IndexedDbQueryCache implements QueryCache {
       )
       .next(() => count > 0);
   }
+
+  getAccumulatedChanges(
+    transaction: PersistenceTransaction,
+    targetId: TargetId,
+    fromVersion: SnapshotVersion
+  ): PersistencePromise<DocumentKeySet> {
+    let documentUpdates = documentKeySet();
+    const range = IDBKeyRange.bound(
+      [targetId, this.serializer.toTimestampArray(fromVersion.toTimestamp())],
+      [targetId + 1],
+      /*lowerOpen=*/ false,
+      /*upperOpen=*/ true
+    );
+    return targetChangeStore(transaction)
+      .iterate({ range }, (_, targetChange) => {
+        documentUpdates = documentUpdates.unionWith(
+          this.serializer.fromDbTargetChange(targetChange)
+        );
+      })
+      .next(() => documentUpdates);
+  }
+
+  private getChanges(
+    transaction: PersistenceTransaction,
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): PersistencePromise<DocumentKeySet> {
+    return targetChangeStore(transaction)
+      .get([
+        targetId,
+        this.serializer.toTimestampArray(snapshotVersion.toTimestamp())
+      ])
+      .next(targetChange => {
+        if (targetChange) {
+          return this.serializer.fromDbTargetChange(targetChange);
+        } else {
+          return documentKeySet();
+        }
+      });
+  }
 }
 
 /**
@@ -357,6 +464,15 @@ function documentTargetStore(
     txn,
     DbTargetDocument.store
   );
+}
+
+/**
+ * Helper to get a typed SimpleDbStore for the target change object store.
+ */
+function targetChangeStore(
+  txn: PersistenceTransaction
+): SimpleDbStore<DbTargetChangeKey, DbTargetChange> {
+  return getStore<DbTargetChangeKey, DbTargetChange>(txn, DbTargetChange.store);
 }
 
 /**

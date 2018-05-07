@@ -126,7 +126,8 @@ export interface QueryCache extends GarbageSource {
   addMatchingKeys(
     transaction: PersistenceTransaction,
     keys: DocumentKeySet,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void>;
 
   /**
@@ -136,7 +137,8 @@ export interface QueryCache extends GarbageSource {
   removeMatchingKeys(
     transaction: PersistenceTransaction,
     keys: DocumentKeySet,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void>;
 
   /**
@@ -144,9 +146,17 @@ export interface QueryCache extends GarbageSource {
    */
   removeMatchingKeysForTargetId(
     transaction: PersistenceTransaction,
-    targetId: TargetId
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
   ): PersistencePromise<void>;
 
+  /** Marks the modified keys of a specific query snapshot at the given target ID. */
+  addModifiedKeys(
+    txn: PersistenceTransaction,
+    keys: DocumentKeySet,
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): PersistencePromise<void>;
   /**
    * Returns the document keys that match the provided target ID.
    *
@@ -155,5 +165,19 @@ export interface QueryCache extends GarbageSource {
   getMatchingKeysForTargetId(
     transaction: PersistenceTransaction,
     targetId: TargetId
+  ): PersistencePromise<DocumentKeySet>;
+
+  /**
+   * Returns the set of documents that were updated by the given target
+   * starting with the provided snapshot version (inclusive).
+   *
+   * Returned document keys are for documents that were added, modified or
+   * removed at all intermediate snapshots and may include documents that only
+   * existed temporarily.
+   */
+  getAccumulatedChanges(
+    transaction: PersistenceTransaction,
+    targetId: TargetId,
+    fromVersion: SnapshotVersion
   ): PersistencePromise<DocumentKeySet>;
 }

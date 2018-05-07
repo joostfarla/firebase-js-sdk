@@ -21,7 +21,7 @@ import {
   DocumentKeySet,
   MaybeDocumentMap
 } from '../model/collections';
-import { MaybeDocument, NoDocument } from '../model/document';
+import { MaybeDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
 import { emptyByteString } from '../platform/platform';
 
@@ -63,54 +63,12 @@ export class RemoteEvent {
      *   * The target must be unacked because unwatching and rewatching
      *     introduces a race for changes.
      */
-    this.targetChanges[targetId] = {
-      mapping: new ResetMapping(),
-      snapshotVersion: SnapshotVersion.MIN,
-      currentStatusUpdate: CurrentStatusUpdate.MarkNotCurrent,
-      resumeToken: emptyByteString()
-    };
-  }
-
-  /**
-   * Synthesize a delete change if necessary for the given limbo target.
-   */
-  synthesizeDeleteForLimboTargetChange(
-    targetChange: TargetChange,
-    key: DocumentKey
-  ): void {
-    if (
-      targetChange.currentStatusUpdate === CurrentStatusUpdate.MarkCurrent &&
-      !this.documentUpdates.get(key)
-    ) {
-      // When listening to a query the server responds with a snapshot
-      // containing documents matching the query and a current marker
-      // telling us we're now in sync. It's possible for these to arrive
-      // as separate remote events or as a single remote event.
-      // For a document query, there will be no documents sent in the
-      // response if the document doesn't exist.
-      //
-      // If the snapshot arrives separately from the current marker,
-      // we handle it normally and updateTrackedLimbos will resolve the
-      // limbo status of the document, removing it from limboDocumentRefs.
-      // This works because clients only initiate limbo resolution when
-      // a target is current and because all current targets are
-      // always at a consistent snapshot.
-      //
-      // However, if the document doesn't exist and the current marker
-      // arrives, the document is not present in the snapshot and our
-      // normal view handling would consider the document to remain in
-      // limbo indefinitely because there are no updates to the document.
-      // To avoid this, we specially handle this case here:
-      // synthesizing a delete.
-      //
-      // TODO(dimond): Ideally we would have an explicit lookup query
-      // instead resulting in an explicit delete message and we could
-      // remove this special logic.
-      this.documentUpdates = this.documentUpdates.insert(
-        key,
-        new NoDocument(key, this.snapshotVersion)
-      );
-    }
+    this.targetChanges[targetId] = new TargetChange(
+      CurrentStatusUpdate.MarkNotCurrent,
+      new ResetMapping(),
+      SnapshotVersion.MIN,
+      emptyByteString()
+    );
   }
 }
 
@@ -130,36 +88,64 @@ export enum CurrentStatusUpdate {
 }
 
 /**
+ * Contains the set of changed documents for a single target in a TargetChange.
+ * Changes are separated into document adds, modifies and removes.
+ */
+export interface TargetChangeSet {
+  /** Whether this target change was a regular update or a target reset. */
+  readonly changeType: 'update' | 'reset';
+  /** The snapshot version that this target change brings us up to. */
+  readonly snapshotVersion: SnapshotVersion;
+  /** The resume token for this target change. */
+  readonly resumeToken: ProtoByteString;
+  readonly addedDocuments: DocumentKeySet;
+  readonly modifiedDocuments: DocumentKeySet;
+  readonly removedDocuments: DocumentKeySet;
+}
+
+/**
  * A part of a RemoteEvent specifying set of changes to a specific target. These
  * changes track what documents are currently included in the target as well as
  * the current snapshot version and resume token but the actual changes *to*
  * documents are not part of the TargetChange since documents may be part of
  * multiple targets.
  */
-export interface TargetChange {
-  /**
-   * The new "current" (synced) status of this target. Set to
-   * CurrentStatusUpdateNone if the status should not be updated. Note "current"
-   * has special meaning in the RPC protocol that implies that a target is
-   * both up-to-date and consistent with the rest of the watch stream.
-   */
-  currentStatusUpdate: CurrentStatusUpdate;
+export class TargetChange {
+  constructor(
+    /**
+     * The new "current" (synced) status of this target. Set to
+     * CurrentStatusUpdateNone if the status should not be updated. Note "current"
+     * has special meaning in the RPC protocol that implies that a target is
+     * both up-to-date and consistent with the rest of the watch stream.
+     */
+    public currentStatusUpdate: CurrentStatusUpdate,
+    /**
+     * A set of changes to documents in this target.
+     */
+    public mapping: TargetMapping,
+    /** The snapshot version that this target change brings us up to. */
+    public snapshotVersion: SnapshotVersion,
+    /**
+     * An opaque, server-assigned token that allows watching a query to be resumed
+     * after disconnecting without retransmitting all the data that matches the
+     * query. The resume token essentially identifies a point in time from which
+     * the server should resume sending results.
+     */
+    public resumeToken: ProtoByteString
+  ) {}
 
-  /**
-   * A set of changes to documents in this target.
-   */
-  mapping: TargetMapping;
+  toChanges(existingKeys: DocumentKeySet): TargetChangeSet {
+    return this.mapping.toChanges(
+      this.snapshotVersion,
+      this.resumeToken,
+      existingKeys
+    );
+  }
 
-  /** The snapshot version that this target change brings us up to. */
-  snapshotVersion: SnapshotVersion;
-
-  /**
-   * An opaque, server-assigned token that allows watching a query to be resumed
-   * after disconnecting without retransmitting all the data that matches the
-   * query. The resume token essentially identifies a point in time from which
-   * the server should resume sending results.
-   */
-  resumeToken: ProtoByteString;
+  /** Returns 'true' if this target was marked CURRENT by the backend. */
+  isCurrent(): boolean {
+    return this.currentStatusUpdate === CurrentStatusUpdate.MarkCurrent;
+  }
 }
 
 export type TargetMapping = ResetMapping | UpdateMapping;
@@ -185,8 +171,19 @@ export class ResetMapping {
     return other !== null && this.docs.isEqual(other.docs);
   }
 
-  filterUpdates(existingKeys: DocumentKeySet): void {
-    // No-op. Resets don't get filtered.
+  toChanges(
+    snapshotVersion: SnapshotVersion,
+    resumeToken: ProtoByteString,
+    existingKeys: DocumentKeySet
+  ): TargetChangeSet {
+    return {
+      snapshotVersion,
+      resumeToken,
+      changeType: 'reset',
+      addedDocuments: this.docs,
+      modifiedDocuments: EMPTY_KEY_SET,
+      removedDocuments: EMPTY_KEY_SET
+    };
   }
 }
 
@@ -224,13 +221,28 @@ export class UpdateMapping {
    * existed in the target, and is being added in the target, and this is not a reset, we can
    * skip doing the work to associate the document with the target because it has already been done.
    */
-  filterUpdates(existingKeys: DocumentKeySet): void {
-    let results = this.addedDocuments;
+  toChanges(
+    snapshotVersion: SnapshotVersion,
+    resumeToken: ProtoByteString,
+    existingKeys: DocumentKeySet
+  ): TargetChangeSet {
+    const changeSet = {
+      snapshotVersion,
+      resumeToken,
+      changeType: 'update',
+      addedDocuments: EMPTY_KEY_SET,
+      modifiedDocuments: EMPTY_KEY_SET,
+      removedDocuments: this.removedDocuments
+    };
+
     this.addedDocuments.forEach(docKey => {
       if (existingKeys.has(docKey)) {
-        results = results.delete(docKey);
+        changeSet.modifiedDocuments = changeSet.modifiedDocuments.add(docKey);
+      } else {
+        changeSet.addedDocuments = changeSet.addedDocuments.add(docKey);
       }
     });
-    this.addedDocuments = results;
+
+    return changeSet as TargetChangeSet;
   }
 }

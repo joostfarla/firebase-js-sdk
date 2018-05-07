@@ -20,7 +20,7 @@ import { TargetId } from '../../../src/core/types';
 import { Persistence } from '../../../src/local/persistence';
 import { QueryCache } from '../../../src/local/query_cache';
 import { QueryData } from '../../../src/local/query_data';
-import { documentKeySet } from '../../../src/model/collections';
+import { DocumentKeySet, documentKeySet } from '../../../src/model/collections';
 import { DocumentKey } from '../../../src/model/document_key';
 
 /**
@@ -72,23 +72,45 @@ export class TestQueryCache {
     return this.cache.getHighestTargetId();
   }
 
-  addMatchingKeys(keys: DocumentKey[], targetId: TargetId): Promise<void> {
+  addMatchingKeys(
+    keys: DocumentKey[],
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): Promise<void> {
     return this.persistence.runTransaction('addMatchingKeys', true, txn => {
       let set = documentKeySet();
       for (const key of keys) {
         set = set.add(key);
       }
-      return this.cache.addMatchingKeys(txn, set, targetId);
+      return this.cache.addMatchingKeys(txn, set, targetId, snapshotVersion);
     });
   }
 
-  removeMatchingKeys(keys: DocumentKey[], targetId: TargetId): Promise<void> {
+  addModifiedKeys(
+    keys: DocumentKey[],
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): Promise<void> {
+    return this.persistence.runTransaction('addModifiedKeys', true, txn => {
+      let set = documentKeySet();
+      for (const key of keys) {
+        set = set.add(key);
+      }
+      return this.cache.addModifiedKeys(txn, set, targetId, snapshotVersion);
+    });
+  }
+
+  removeMatchingKeys(
+    keys: DocumentKey[],
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): Promise<void> {
     return this.persistence.runTransaction('removeMatchingKeys', true, txn => {
       let set = documentKeySet();
       for (const key of keys) {
         set = set.add(key);
       }
-      return this.cache.removeMatchingKeys(txn, set, targetId);
+      return this.cache.removeMatchingKeys(txn, set, targetId, snapshotVersion);
     });
   }
 
@@ -104,12 +126,19 @@ export class TestQueryCache {
       });
   }
 
-  removeMatchingKeysForTargetId(targetId: TargetId): Promise<void> {
+  removeMatchingKeysForTargetId(
+    targetId: TargetId,
+    snapshotVersion: SnapshotVersion
+  ): Promise<void> {
     return this.persistence.runTransaction(
       'removeMatchingKeysForTargetId',
       true,
       txn => {
-        return this.cache.removeMatchingKeysForTargetId(txn, targetId);
+        return this.cache.removeMatchingKeysForTargetId(
+          txn,
+          targetId,
+          snapshotVersion
+        );
       }
     );
   }
@@ -125,6 +154,17 @@ export class TestQueryCache {
       'setLastRemoteSnapshotVersion',
       true,
       txn => this.cache.setLastRemoteSnapshotVersion(txn, version)
+    );
+  }
+
+  getAccumulatedChanges(
+    targetId: TargetId,
+    fromVersion: SnapshotVersion
+  ): Promise<DocumentKeySet> {
+    return this.persistence.runTransaction(
+      'getAccumulatedChanges',
+      false,
+      txn => this.cache.getAccumulatedChanges(txn, targetId, fromVersion)
     );
   }
 }

@@ -273,24 +273,24 @@ export function addTargetMapping(
     const k = docOrKey instanceof Document ? docOrKey.key : key(docOrKey);
     mapping.addedDocuments = mapping.addedDocuments.add(k);
   }
-  return {
+  return new TargetChange(
+    CurrentStatusUpdate.None,
     mapping,
-    snapshotVersion: SnapshotVersion.MIN,
-    resumeToken: emptyByteString(),
-    currentStatusUpdate: CurrentStatusUpdate.None
-  };
+    SnapshotVersion.MIN,
+    emptyByteString()
+  );
 }
 
 export function ackTarget(
   ...docsOrKeys: Array<Document | string>
 ): TargetChange {
   const targetChange = addTargetMapping(...docsOrKeys);
-  return {
-    mapping: targetChange.mapping,
-    snapshotVersion: targetChange.snapshotVersion,
-    resumeToken: emptyByteString(),
-    currentStatusUpdate: CurrentStatusUpdate.MarkCurrent
-  };
+  return new TargetChange(
+    CurrentStatusUpdate.MarkCurrent,
+    targetChange.mapping,
+    targetChange.snapshotVersion,
+    emptyByteString()
+  );
 }
 
 export function limboChanges(changes: {
